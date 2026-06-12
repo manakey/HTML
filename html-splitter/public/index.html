@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>HTMLソース分割ツール (完全決定版)</title>
+    <style>
+        body { font-family: sans-serif; background: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; flex-direction: column; }
+        .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; max-width: 400px; width: 100%; }
+        h1 { font-size: 20px; color: #333; margin-bottom: 20px; }
+        input[type="file"] { display: none; }
+        .file-label { display: block; background: #e0e0e0; padding: 15px; border-radius: 5px; cursor: pointer; border: 2px dashed #999; margin-bottom: 20px; }
+        .file-label:hover { background: #d5d5d5; }
+        button { background: #28a745; color: white; border: none; padding: 12px 24px; border-radius: 5px; cursor: pointer; font-size: 16px; width: 100%; font-weight: bold; }
+        button:hover { background: #218838; }
+        #fileName { margin-top: -10px; margin-bottom: 20px; font-size: 14px; color: #666; font-weight: bold; }
+        
+        .progress-container { width: 100%; background-color: #e9ecef; border-radius: 5px; margin-top: 20px; display: none; overflow: hidden; }
+        .progress-bar { width: 0%; height: 20px; background-color: #007bff; text-align: center; line-height: 20px; color: white; font-size: 12px; font-weight: bold; transition: width 0.1s ease; border-radius: 5px; }
+        
+        #status { margin-top: 15px; font-size: 14px; color: #333; font-weight: bold; }
+        #errorLog { margin-top: 20px; color: red; font-size: 12px; text-align: left; background: #ffe6e6; padding: 10px; border-radius: 5px; display: none; white-space: pre-wrap; width: 100%; max-width: 400px; box-sizing: border-box; }
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h1>HTML・CSS・JS 分割ツール</h1>
+    <label class="file-label">
+        HTMLファイルを選択
+        <input type="file" id="htmlfile" accept=".html" onchange="displayFileName(this)">
+    </label>
+    <div id="fileName"></div>
+    <button type="button" onclick="processHTML()">変換してダウンロード</button>
+    
+    <div class="progress-container" id="progressContainer">
+        <div class="progress-bar" id="progressBar">0%</div>
+    </div>
+    
+    <div id="status"></div>
+</div>
+
+<div id="errorLog"></div>
+<script>
+    let uploadedFile = null;
+
+    function displayFileName(input) {
+        if (input.files && input.files[0]) {
+            uploadedFile = input.files[0];
+            document.getElementById('fileName').textContent = "選択中: " + uploadedFile.name;
+            document.getElementById('status').textContent = "";
+            document.getElementById('progressContainer').style.display = 'none';
+            document.getElementById('errorLog').style.display = 'none';
+            updateProgressBar(0);
+        }
+    }
+
+    function updateProgressBar(percent) {
+        const progressBar = document.getElementById('progressBar');
+        progressBar.style.width = percent + '%';
+        progressBar.textContent = Math.round(percent) + '%';
+    }
+
+    function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+    function stringToUtf8ByteArray(str) {
+        const out = []; let p = 0;
+        for (let i = 0; i < str.length; i++) {
+            let c = str.charCodeAt(i);
+            if (c < 128) { out[p++] = c; }
+            else if (c < 2048) { out[p++] = (c >> 6) | 192; out[p++] = (c & 63) | 128; }
+            else { out[p++] = (c >> 12) | 224; out[p++] = ((c >> 6) & 63) | 128; out[p++] = (c & 63) | 128; }
+        }
+        return new Uint8Array(out);
+    }
+
+    // iPadの検証エラーを回避するためのCRC32計算
+    function makeCrcTable() {
+        let c; const crcTable = [];
+        for (let n = 0; n < 256; n++) {
+            c = n;
+            for (let k = 0; k < 8; k++) { c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1)); }
+            crcTable[n] = c;
+        }
+        return crcTable;
+    }
+    const crcTable = makeCrcTable();
+    function calculateCrc32(uint8Array) {
+        let crc = 0 ^ (-1);
+        for (let i = 0; i < uint8Array.length; i++) { crc = (crc >>> 8) ^ crcTable[(crc ^ uint8Array[i]) & 0xFF]; }
+        return (crc ^ (-1)) >>> 0;
+    }
+
+    function generateZipBlob(files) {
+        const buffers = []; let currentOffset = 0;
+        const fileDataList = files.map(file => {
+            const nameBytes = stringToUtf8ByteArray(file.name);
+            const contentBytes = stringToUtf8ByteArray(file.content);
+            const crc = calculateCrc32(contentBytes);
+            return { nameBytes, contentBytes, size: contentBytes.length, crc, offset: 0 };
+        });
+
+        // 1. 各ファイルのデータヘッダー
+        fileDataList.forEach(file => {
+            file.offset = currentOffset;
+            const header = new ArrayBuffer(30 + file.nameBytes.length);
+            const view = new DataView(header);
+            view.setUint32(0, 0x04034b50, true);
+            view.setUint16(4, 10, true);
+            view.setUint16(6, 0x800, true);
+            view.setUint32(14, file.crc, true);
+            view.setUint32(18, file.size, true);
+            view.setUint32(22, file.size, true);
+            view.setUint16(26, file.nameBytes.length, true);
+            const headerBytes = new Uint8Array(header);
+            headerBytes.set(file.nameBytes, 30);
+            buffers.push(headerBytes, file.contentBytes);
+            currentOffset += headerBytes.length + file.contentBytes.length;
+        });
+
+        // 2. 目次ヘッダー
+        const centralDirectoryOffset = currentOffset;
+        fileDataList.forEach(file => {
+            const centralHeader = new ArrayBuffer(46 + file.nameBytes.length);
+            const view = new DataView(centralHeader);
+            view.setUint32(0, 0x02014b50, true);
+            view.setUint16(6, 10, true);
+            view.setUint16(8, 0x800, true);
+            view.setUint32(16, file.crc, true);
+            view.setUint32(20, file.size, true);
+            view.setUint32(24, file.size, true);
+            view.setUint16(28, file.nameBytes.length, true);
+            view.setUint32(42, file.offset, true);
+            const centralHeaderBytes = new Uint8Array(centralHeader);
+            centralHeaderBytes.set(file.nameBytes, 46);
+            buffers.push(centralHeaderBytes);
+            currentOffset += centralHeaderBytes.length;
+        });
+
+        // 3. 終端ヘッダー
+        const eocd = new ArrayBuffer(22);
+        const eocdView = new DataView(eocd);
+        eocdView.setUint32(0, 0x06054b50, true);
+        eocdView.setUint16(8, files.length, true);
+        eocdView.setUint16(10, files.length, true);
+        eocdView.setUint32(12, currentOffset - centralDirectoryOffset, true);
+        eocdView.setUint32(16, centralDirectoryOffset, true);
+        buffers.push(new Uint8Array(eocd));
+
+        return new Blob(buffers, { type: "application/zip" });
+    }
+
+    async function processHTML() {
+        if (!uploadedFile) {
+            alert("ファイルを選択してください。");
+            return;
+        }
+
+        const progressContainer = document.getElementById('progressContainer');
+        const status = document.getElementById('status');
+        const errorLog = document.getElementById('errorLog');
+        
+        progressContainer.style.display = 'block';
+        errorLog.style.display = 'none';
+        
+        try {
+            status.textContent = "ファイルを読み込み中...";
+            updateProgressBar(20);
+            await sleep(150);
+
+            const reader = new FileReader();
+
+            reader.onerror = function() {
+                throw new Error("ファイルの読み込みに失敗しました。");
+            };
+
+            reader.onload = async function(e) {
+                try {
+                    status.textContent = "HTMLを解析・分割中...";
+                    updateProgressBar(50);
+                    await sleep(150);
+
+                    const htmlContent = e.target.result;
+                    const originalName = uploadedFile.name.replace(/\.[^/.]+$/, "");
+
+                    const parser = new DOMParser();
+                    const doc = parser.parseFromString(htmlContent, 'text/html');
+
+                    let cssContent = '';
+                    let jsContent = '';
+
+                    const styles = doc.querySelectorAll('style');
+                    styles.forEach(style => {
+                        if (style.textContent) cssContent += style.textContent + '\n';
+                        style.remove();
+                    });
+
+                    const scripts = doc.querySelectorAll('script');
+                    scripts.forEach(script => {
+                        if (script.textContent && !script.hasAttribute('src')) {
+                            jsContent += script.textContent + '\n';
+                            script.remove();
+                        }
+                    });
+
+                    if (cssContent.trim() && doc.head) {
+                        const link = doc.createElement('link');
+                        link.rel = 'stylesheet';
+                        link.href = `${originalName}.css`;
+                        doc.head.appendChild(link);
+                    }
+
+                    if (jsContent.trim() && doc.body) {
+                        const scriptTag = doc.createElement('script');
+                        scriptTag.src = `${originalName}.js`;
+                        doc.body.appendChild(scriptTag);
+                    }
+
+                    status.textContent = "本物のZIPアーカイブを生成中...";
+                    updateProgressBar(80);
+                    await sleep(150); 
+
+                    const finalHtml = "<!DOCTYPE html>\n" + doc.documentElement.outerHTML;
+                    
+                    const filesToZip = [
+                        { name: `${originalName}.html`, content: finalHtml }
+                    ];
+                    
+                    if (cssContent.trim()) {
+                        filesToZip.push({ name: `${originalName}.css`, content: cssContent.trim() });
+                    }
+                    if (jsContent.trim()) {
+                        filesToZip.push({ name: `${originalName}.js`, content: jsContent.trim() });
+                    }
+
+                    const zipBlob = generateZipBlob(filesToZip);
+
+                    updateProgressBar(100);
+                    status.textContent = "完了しました！ZIPファイルを保存します。";
+                    await sleep(200);
+                    
+                    const downloadLink = document.createElement("a");
+                    downloadLink.href = URL.createObjectURL(zipBlob);
+                    downloadLink.download = `${originalName}_split.zip`;
+                    document.body.appendChild(downloadLink);
+                    downloadLink.click();
+                    document.body.removeChild(downloadLink);
+                    
+                } catch (err) {
+                    showError(err);
+                }
+            };
+
+            reader.readAsText(uploadedFile);
+
+        } catch (err) {
+            showError(err);
+        }
+    }
+
+    function showError(err) {
+        console.error(err);
+        const status = document.getElementById('status');
+        const errorLog = document.getElementById('errorLog');
+        const progressBar = document.getElementById('progressBar');
+        
+        status.textContent = "エラーが発生しました。";
+        progressBar.style.backgroundColor = '#dc3545';
+        
+        errorLog.textContent = "【エラー詳細】\n" + err.message;
+        errorLog.style.display = 'block';
+    }
+</script>
+</body>
+</html>
